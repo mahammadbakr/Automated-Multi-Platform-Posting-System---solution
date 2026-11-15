@@ -25,6 +25,7 @@ The endpoint picks the platforms itself. Each one runs on its own: if one fails 
 - [Project structure](#project-structure)
 - [Testing](#testing)
 - [Logs from a real run](#logs-from-a-real-run)
+- [Security](#security)
 - [Design decisions](#design-decisions)
 - [Adding a new platform](#adding-a-new-platform)
 
@@ -72,6 +73,10 @@ All credentials come from environment variables, either a `.env` file in the pro
 | `TELEGRAPH_ACCESS_TOKEN` | Telegraph | See below |
 | `TELEGRAPH_AUTHOR_NAME` | Telegraph | Optional byline shown on the page |
 | `REQUEST_TIMEOUT` | All | HTTP timeout in seconds, default `15` |
+| `API_KEY` | Endpoint security | **Recommended.** When set, clients must send it in the `X-API-Key` header. Generate one with `python3 -c "import secrets; print(secrets.token_urlsafe(32))"` |
+| `RATE_LIMIT_PER_MINUTE` | Endpoint security | Max `POST /posting` requests per client IP per minute, default `10` |
+
+The settings are checked at startup. `MASTODON_BASE_URL` and `BLUESKY_SERVICE_URL` must use `https://`, since tokens are sent to them. `DISCORD_WEBHOOK_URL` must be a real `discord.com/api/webhooks/...` URL. If a value is wrong, the app refuses to start and says which setting is wrong, without printing the secret.
 
 **Telegraph token.** Telegraph has no sign-up form. An account is created with a single API call that returns an `access_token`:
 
@@ -90,8 +95,11 @@ curl "https://api.telegra.ph/createAccount?short_name=MyPoster&author_name=My%20
 ```bash
 curl -X POST http://localhost:4000/posting \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: <your API_KEY>" \
   -d '{"message": "Check out our latest business platform and grow your online visibility. https://example.com"}'
 ```
+
+Leave out the `X-API-Key` header if `API_KEY` isn't set. In Swagger UI, use the **Authorize** button.
 
 **Response `200 OK`** (example with four platforms configured and two broken)
 
@@ -180,6 +188,18 @@ A valid request always gets `200`, even if every platform failed. The request it
 }
 ```
 
+**Other errors** use the same format:
+
+| Status | When |
+|---|---|
+| `401` | `API_KEY` is set and the `X-API-Key` header is missing or wrong |
+| `413` | Request body is over 16 KB |
+| `429` | Rate limit hit. The `Retry-After` header says how many seconds to wait. |
+
+```json
+{ "success": false, "errors": [{ "field": null, "message": "Invalid or missing API key" }] }
+```
+
 ### `GET /platforms`
 
 Shows which integrations are ready, which helps when setting up `.env`:
@@ -266,6 +286,8 @@ PostingResponse {"success": ..., "results": [...]}
 │   ├── config.py                # Settings loaded from env / .env (pydantic-settings)
 │   ├── schemas.py               # Request/response models + message validation
 │   ├── links.py                 # Link detection and URL validation
+│   ├── security.py              # API key check + per-IP rate limiter
+│   ├── middleware.py            # Request body size limit
 │   ├── platforms/
 │   │   ├── __init__.py          # Platform registry (build_platforms)
 │   │   ├── base.py              # Platform ABC, PublishedPost, PlatformError, ensure_ok()
@@ -282,7 +304,8 @@ PostingResponse {"success": ..., "results": [...]}
 │   ├── test_validation.py       # Link detection, URL rules, PostRequest validation
 │   ├── test_platforms.py        # Each integration against mocked HTTP (respx)
 │   ├── test_posting_service.py  # Failure isolation, concurrency, error mapping
-│   └── test_posting.py          # API endpoints via FastAPI TestClient
+│   ├── test_posting.py          # API endpoints via FastAPI TestClient
+│   └── test_security.py         # API key, rate limit, body limit, config hardening
 ├── .env.example
 ├── requirements.txt
 ├── requirements-dev.txt
@@ -310,20 +333,18 @@ What's covered:
 - **Security:** the Telegram bot token, which is part of the request URL, never shows up in error messages.
 - **Service:** one failure doesn't stop the others; unconfigured platforms send no request; timeouts and network errors become clean messages; unexpected exceptions are contained and logged; platforms really do run concurrently.
 - **API:** response shape, the 422 error format, malformed JSON, a missing field, `/platforms`, `/docs`.
+- **Hardening:** API key (missing, wrong, correct), rate limiting (including wrong-key guesses), 413 for big and chunked bodies, HTTPS-only base URLs, the webhook URL format, and that secrets never appear in validation errors or reprs.
 
 Latest run:
 
 ```
 $ pytest --cov=app --cov-report=term-missing
-........................................................................ [ 98%]
-.                                                                        [100%]
-
 Name                              Stmts   Miss  Cover
 -----------------------------------------------------
-app/config.py                        20      0   100%
+app/config.py                        36      0   100%
 app/links.py                         17      0   100%
-app/main.py                          36      0   100%
-app/platforms/__init__.py            13      0   100%
+app/main.py                          48      0   100%
+app/middleware.py                    45      2    96%
 app/platforms/base.py                35      1    97%
 app/platforms/bluesky.py             17      0   100%
 app/platforms/discord.py             11      0   100%
@@ -332,10 +353,11 @@ app/platforms/mastodon.py            11      0   100%
 app/platforms/telegram.py            20      0   100%
 app/platforms/telegraph.py           21      0   100%
 app/schemas.py                       29      0   100%
+app/security.py                      31      0   100%
 app/services/posting_service.py      42      0   100%
 -----------------------------------------------------
-TOTAL                               281      1    99%
-73 passed in 1.46s
+TOTAL                               385      3    99%
+103 passed in 1.95s
 ```
 
 Lint: `ruff check app tests`
@@ -344,32 +366,59 @@ Lint: `ruff check app tests`
 
 ## Logs from a real run
 
-**Server started with the required command, no credentials configured:**
+**Live run against the real APIs.** Discord used a real webhook. The other five used deliberately invalid credentials, to show that each integration reaches the real endpoint, sends a request the API understands, and turns the rejection into a clean error. Even with five platforms failing, Discord still posted:
 
 ```
-$ uvicorn app.main:app --host 0.0.0.0 --port 4000
-INFO:     Started server process [3884]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
+success: True
+  Telegram     failed   HTTP 401: Unauthorized: invalid token specified
+  Discord      success  https://discord.com/channels/1571486850248605729/1571486850756120659/1571488681884385420
+  Mastodon     failed   HTTP 401: The access token is invalid
+  Bluesky      failed   HTTP 401: Invalid identifier or password
+  GitHub Gist  failed   HTTP 401: Bad credentials
+  Telegraph    failed   ACCESS_TOKEN_INVALID
+```
+
+**Server log for the same run.** No tokens or webhook URLs appear in it:
+
+```
 INFO:     Uvicorn running on http://0.0.0.0:4000 (Press CTRL+C to quit)
-2026-11-15 14:12:37,291 INFO app.services.posting_service: Posted to 0 of 6 platforms
-INFO:     127.0.0.1:49533 - "POST /posting HTTP/1.1" 200 OK
-INFO:     127.0.0.1:49535 - "POST /posting HTTP/1.1" 422 Unprocessable Content
-INFO:     127.0.0.1:49537 - "GET /docs HTTP/1.1" 200 OK
+WARNING app.services.posting_service: Telegram: HTTP 401: Unauthorized: invalid token specified
+WARNING app.services.posting_service: Mastodon: HTTP 401: The access token is invalid
+WARNING app.services.posting_service: GitHub Gist: HTTP 401: Bad credentials
+WARNING app.services.posting_service: Telegraph: ACCESS_TOKEN_INVALID
+WARNING app.services.posting_service: Bluesky: HTTP 401: Invalid identifier or password
+INFO app.services.posting_service: Discord: posted https://discord.com/channels/1571486850248605729/1571486850756120659/1571488681884385420
+INFO app.services.posting_service: Posted to 1 of 6 platforms
 ```
 
-**Live check against the real APIs with deliberately invalid credentials.** This shows that every integration reaches the real endpoint, sends a request the API understands, and turns the API's rejection into a clean error:
+**Protections checked on the running server:**
 
 ```
-Telegram     failed   HTTP 401: Unauthorized: invalid token specified
-Discord      failed   HTTP 404: Unknown Webhook
-Mastodon     failed   HTTP 401: The access token is invalid
-Bluesky      failed   HTTP 401: Invalid identifier or password
-GitHub Gist  failed   HTTP 401: Bad credentials
-Telegraph    failed   ACCESS_TOKEN_INVALID
+no API key          -> 401 {"success":false,"errors":[{"field":null,"message":"Invalid or missing API key"}]}
+wrong API key       -> 401
+20 KB body          -> 413 {"success": false, "errors": [{"field": "body", "message": "Request body is too large"}]}
+two links           -> 422 {"success":false,"errors":[{"field":"message","message":"Message must contain exactly one CTA link (found 2)"}]}
+4th wrong-key guess -> 429 (RATE_LIMIT_PER_MINUTE=3)
 ```
 
-Fill in `.env` with real credentials and the same request returns `success` entries with live post URLs.
+---
+
+## Security
+
+| Risk | What the app does |
+|---|---|
+| Anyone on the network posting to your accounts (the server binds to `0.0.0.0`) | Optional `API_KEY`, checked with `secrets.compare_digest` so the comparison time gives nothing away. A warning is logged at startup if it isn't set. |
+| Spam, or someone guessing the API key | Per-IP rate limit. It runs **before** the key check, so wrong guesses are throttled too. |
+| Memory exhaustion from huge bodies | ASGI middleware rejects bodies over 16 KB with `413`. It checks `Content-Length` and also counts streamed bytes, so chunked uploads can't get around it. |
+| Tokens leaking into logs | httpx request logging is turned down, because Telegram and Discord URLs contain the token. `raise_for_status()` isn't used. Network errors only show the exception type. |
+| Tokens leaking into config errors | All tokens are `SecretStr`, and settings use `hide_input_in_errors`, so a bad value is never echoed back. |
+| Tokens sent over plain HTTP | Mastodon and Bluesky base URLs must be `https://`. |
+| Misconfigured or look-alike webhook URL | `DISCORD_WEBHOOK_URL` must match the official `discord.com/api/webhooks/<id>/<token>` format. |
+| `@everyone` / `@here` mass pings on Discord | Every webhook call sends `allowed_mentions: {"parse": []}`, so no mention in a message can ping anyone. |
+| Server-side request forgery | The service never requests the user's CTA link. It only calls fixed platform hosts that come from your config. |
+| Secrets in the repo | `.env` is in `.gitignore`, and only `.env.example` with empty values is committed. |
+
+Checked with `bandit -r app` (no issues) and `pip-audit -r requirements.txt` (no known vulnerabilities).
 
 ---
 
@@ -386,7 +435,7 @@ Fill in `.env` with real credentials and the same request returns `success` entr
 ### Limitations and possible next steps
 
 - No retry or backoff yet. Mastodon's idempotency key makes retries safe there, and a small retry wrapper in `PostingService` would be the natural next step.
-- No authentication on the endpoint itself. In production it would sit behind an API key or OAuth, with rate limiting.
+- The rate limiter lives in memory, so each process counts on its own. With several workers or instances it would need a shared store such as Redis. Behind a reverse proxy it would also need to read the real client IP from the proxy headers.
 - X/Twitter, LinkedIn, Facebook and Reddit were left out on purpose: they need paid API tiers or app review before you can post, which doesn't fit a project that has to run locally. They would plug into the same `Platform` interface.
 
 ---

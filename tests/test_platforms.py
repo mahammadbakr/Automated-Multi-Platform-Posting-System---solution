@@ -94,7 +94,10 @@ class TestDiscord:
 
         assert post.url == "https://discord.com/channels/100/200/300"
         assert post.public is False
-        assert json.loads(post_route.calls.last.request.content) == {"content": MESSAGE}
+        assert json.loads(post_route.calls.last.request.content) == {
+            "content": MESSAGE,
+            "allowed_mentions": {"parse": []},
+        }
 
     @respx.mock
     async def test_invalid_webhook(self, settings, client):

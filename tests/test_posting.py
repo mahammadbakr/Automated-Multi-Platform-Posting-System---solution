@@ -3,6 +3,7 @@ import datetime as dt
 import pytest
 from fastapi.testclient import TestClient
 
+from app.config import Settings, get_settings
 from app.main import app, get_posting_service
 from app.schemas import PlatformInfo, PlatformResult, PostingResponse
 from tests.conftest import MESSAGE
@@ -37,6 +38,7 @@ class StubService:
 def service():
     stub = StubService()
     app.dependency_overrides[get_posting_service] = lambda: stub
+    app.dependency_overrides[get_settings] = lambda: Settings(_env_file=None)
     yield stub
     app.dependency_overrides.clear()
 

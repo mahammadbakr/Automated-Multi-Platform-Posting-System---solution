@@ -11,7 +11,12 @@ class DiscordPlatform(Platform):
         webhook_url = self.settings.discord_webhook_url.get_secret_value()
 
         # wait=true makes Discord return the created message instead of 204 No Content.
-        response = await self.client.post(webhook_url, params={"wait": "true"}, json={"content": message})
+        response = await self.client.post(
+            webhook_url,
+            params={"wait": "true"},
+            # Never let a message ping @everyone, @here, roles or users.
+            json={"content": message, "allowed_mentions": {"parse": []}},
+        )
         posted = self.ensure_ok(response)
 
         # The message payload has no guild_id, but the webhook object does.
