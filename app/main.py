@@ -14,6 +14,8 @@ from app.schemas import PlatformInfo, PostingResponse, PostRequest
 from app.services.posting_service import PostingService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# httpx logs every request URL at INFO, and Telegram/Discord URLs contain the secret token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 @asynccontextmanager

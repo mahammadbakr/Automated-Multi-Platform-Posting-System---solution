@@ -137,3 +137,10 @@ def test_openapi_docs_available():
     with TestClient(app) as test_client:
         assert test_client.get("/docs").status_code == 200
         assert "/posting" in test_client.get("/openapi.json").json()["paths"]
+
+
+def test_httpx_request_logs_are_silenced():
+    # Request URLs for Telegram and Discord contain secrets, so httpx must not log them.
+    import logging
+
+    assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
